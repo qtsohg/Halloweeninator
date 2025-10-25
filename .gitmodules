@@ -1,0 +1,3 @@
+[submodule "lib/OlPie-esp32-modules"]
+	path = lib/OlPie-esp32-modules
+	url = https://github.com/qtsohg/OlPie-esp32-modules.git
