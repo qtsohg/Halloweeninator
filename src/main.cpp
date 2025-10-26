@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <espmods/core.hpp>
 #include <espmods/network.hpp>
 #include <espmods/led.hpp>
@@ -10,33 +11,39 @@ using espmods::network::NetWifiOta;
 using espmods::network::NetworkConfig;
 using espmods::led::LedStrip;
 using espmods::audio::AudioDySv5w;
+using espmods::audio::PlayState;
 
 
 NetWifiOta wifiOta_;
-LedStrip ledStrip_(LED_PIN, 50, 128);
-AudioDySv5w audio(AUDIO_TX_PIN, AUDIO_RX_PIN);
+LedStrip ledStrip_(LED_PIN, LED_COUNT, LED_BRIGHTNESS);
+AudioDySv5w audio_(AUDIO_TX_PIN, AUDIO_RX_PIN);
 
 
 struct EffectConfig {
   const char *name;         // Friendly label for logging
-  const char *soundEffect;  // Identifier / filename for the audio clip
-  const char *lightEffect;  // Identifier for the lighting routine
+  uint16_t soundEffectIdx;  // Identifier / filename for the audio clip
+  uint16_t lightEffect;  // Identifier for the lighting routine
 };
 
 // Configure your available effect combinations here.
 static const EffectConfig kEffects[] = {
-    {"Creepy Laugh", "track_1.mp3", "purple_fade"},
-    {"Ghoul Growl", "track_2.mp3", "strobe_white"},
-    {"Witch Cackle", "track_3.mp3", "orange_wave"},
+    {"0001", 1, 2},
+    {"0002", 2, 1},
+    {"0003", 3, 3},
+    {"0004", 4, 4},
+    {"0005", 5, 5},
+    {"0006", 6, 6},
+    {"0007", 7, 7},
+    {"0008", 1, 1},
 };
 
-static constexpr size_t kEffectCount = sizeof(kEffects) / sizeof(kEffects[0]);
+static constexpr size_t kEffectCount = 8;
 
 // Adjustable runtime parameters.
-static float g_detectionDistanceCm = 30.0f;             // Trigger distance
-static constexpr uint32_t kCooldownMinMs = 5000;        // Minimum cooldown after an effect
-static constexpr uint32_t kCooldownMaxMs = 15000;       // Maximum cooldown after an effect
-static constexpr uint32_t kSensorPollIntervalMs = 100;  // Sensor sampling interval
+static float g_detectionDistanceCm = 60.0f;             // Trigger distance
+static constexpr uint32_t kCooldownMinMs = 1000;        // Minimum cooldown after an effect
+static constexpr uint32_t kCooldownMaxMs = 5000;       // Maximum cooldown after an effect
+static constexpr uint32_t kSensorPollIntervalMs = 500;  // Sensor sampling interval
 
 // -----------------------------------------------------------------------------
 // Internal state
@@ -44,6 +51,7 @@ static constexpr uint32_t kSensorPollIntervalMs = 100;  // Sensor sampling inter
 
 static unsigned long g_nextTriggerReadyAt = 0;
 static unsigned long g_lastSensorSampleAt = 0;
+static size_t g_currentEffectIndex = 0;  // For sequential effect playback
 
 // -----------------------------------------------------------------------------
 // Forward declarations
@@ -52,8 +60,8 @@ static unsigned long g_lastSensorSampleAt = 0;
 float readDistanceCm();
 void triggerEffect(const EffectConfig &effect);
 void scheduleNextTrigger();
-void playSoundEffect(const char *effectId);
-void playLightEffect(const char *effectId);
+void playSoundEffect(uint16_t effectId);
+void playLightEffect(uint16_t effectId);
 
 // Allow runtime tuning of the detection distance.
 void setDetectionDistanceCm(float distanceCm) { g_detectionDistanceCm = distanceCm; }
@@ -65,12 +73,11 @@ void setup() {
   ledStrip_.begin();
   ledStrip_.sparkle(0xEEF22F);
 
-  audio.begin();
+  audio_.begin();
 
   // configure network
   NetworkConfig config = createNetworkConfig();
   
-
   wifiOta_.begin(config);
 
   pinMode(ULTRA_TRIG_PIN, OUTPUT);
@@ -86,6 +93,30 @@ void loop() {
 
   wifiOta_.loop();
   ledStrip_.update();
+  audio_.update();
+
+  // Check WiFi connection periodically
+  static unsigned long lastWifiCheck = 0;
+  if (now - lastWifiCheck > 10000) {  // Check every 10 seconds
+    lastWifiCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      LogSerial.println("WARNING: WiFi disconnected!");
+    } else {
+      LogSerial.printf("WiFi OK - RSSI: %d dBm\n", WiFi.RSSI());
+    }
+  }
+
+  // Print audio play state less frequently
+  static unsigned long lastAudioStateLog = 0;
+  if (now - lastAudioStateLog > 2000) {  // Every 2 seconds instead of every poll
+    lastAudioStateLog = now;
+    PlayState playState = audio_.getPlayState();
+    
+   if (playState == PlayState::STOP) {
+      LogSerial.printf("Audio is active (state: STOP)\n");
+      ledStrip_.off();
+    }
+  }
 
   if (now - g_lastSensorSampleAt < kSensorPollIntervalMs) {
     delay(5);
@@ -95,20 +126,35 @@ void loop() {
   g_lastSensorSampleAt = now;
 
   const float distanceCm = readDistanceCm();
+ 
+  
+
   if (distanceCm < 0.0f) {
     // No valid reading, try again on the next loop iteration.
     return;
   }
+  LogSerial.printf("Distance: %.2f cm\n", distanceCm);
 
   if (distanceCm <= g_detectionDistanceCm && now >= g_nextTriggerReadyAt) {
-    const size_t effectIndex = static_cast<size_t>(random(static_cast<long>(kEffectCount)));
+    // Check if audio is ready before triggering
+    PlayState currentPlayState = audio_.getPlayState();
+    if (currentPlayState != PlayState::STOP) {
+      LogSerial.printf("Audio busy (state: %d), skipping trigger\n", static_cast<int>(currentPlayState));
+      return;
+    }
+    
+    // Sequential effect selection for debugging
+    const size_t effectIndex = g_currentEffectIndex;
+    g_currentEffectIndex = (g_currentEffectIndex + 1) % kEffectCount;
+    
     const EffectConfig &effect = kEffects[effectIndex];
 
-    Serial.printf("Target detected at %.2f cm. Triggering effect: %s\n", distanceCm,
-                  effect.name);
+    LogSerial.printf("Target detected at %.2f cm. Triggering effect: %s (index %zu)\n", distanceCm,
+                  effect.name, effectIndex);
     triggerEffect(effect);
     scheduleNextTrigger();
   }
+    
 }
 
 // -----------------------------------------------------------------------------
@@ -126,6 +172,7 @@ float readDistanceCm() {
   // Listen for the echo; timeout after 30ms (~5m distance) to avoid stalling.
   const unsigned long duration = pulseIn(ULTRA_ECHO_PIN, HIGH, 30000UL);
   if (duration == 0) {
+    LogSerial.println("Distance measurement timed out");
     return -1.0f;  // Timeout
   }
 
@@ -135,7 +182,7 @@ float readDistanceCm() {
 }
 
 void triggerEffect(const EffectConfig &effect) {
-  playSoundEffect(effect.soundEffect);
+  playSoundEffect(effect.soundEffectIdx);
   playLightEffect(effect.lightEffect);
 }
 
@@ -143,20 +190,111 @@ void scheduleNextTrigger() {
   const uint32_t cooldownDelay = static_cast<uint32_t>(
       random(static_cast<long>(kCooldownMinMs), static_cast<long>(kCooldownMaxMs) + 1));
   g_nextTriggerReadyAt = millis() + cooldownDelay;
-  Serial.printf("Next trigger available in %lu ms\n", static_cast<unsigned long>(cooldownDelay));
+  LogSerial.printf("Next trigger available in %lu ms\n", static_cast<unsigned long>(cooldownDelay));
 }
 
 // -----------------------------------------------------------------------------
 // Hardware integration stubs
 // -----------------------------------------------------------------------------
 
-void playSoundEffect(const char *effectId) {
-  // TODO: Integrate with your audio playback hardware (e.g., DFPlayer, I2S).
-  Serial.printf("  -> Playing sound effect: %s\n", effectId);
+void playSoundEffect(uint16_t effectId) {
+  LogSerial.printf("  -> Attempting to play sound effect ID: %u\n", effectId);
+  
+  // First, always stop any current playback and wait for it to actually stop
+  LogSerial.println("  -> Stopping current audio");
+  audio_.endPlay();
+  
+  // Wait for the stop command to be processed and confirmed
+  uint32_t stopStartTime = millis();
+  bool stopConfirmed = false;
+  while (millis() - stopStartTime < 1000 && !stopConfirmed) { // 1 second timeout
+    delay(100);
+    PlayState currentState = audio_.getPlayState();
+    if (currentState == PlayState::STOP) {
+      stopConfirmed = true;
+      LogSerial.println("  -> Stop confirmed");
+    }
+  }
+  
+  if (!stopConfirmed) {
+    LogSerial.println("  -> WARNING: Stop not confirmed, proceeding anyway");
+  }
+  
+  // Additional delay to ensure module is ready
+  delay(100);
+  
+  // Now send the play command
+  LogSerial.println("  -> Sending play command");
+  audio_.play(effectId);
+  
+  // Wait for the play command to be processed and confirmed
+  uint32_t playStartTime = millis();
+  bool playConfirmed = false;
+  while (millis() - playStartTime < 1000 && !playConfirmed) { // 1 second timeout
+    delay(150); // Longer delay between checks
+    PlayState currentState = audio_.getPlayState();
+    LogSerial.printf("  -> Checking play state: %d\n", static_cast<int>(currentState));
+    if (currentState == PlayState::PLAY) {
+      playConfirmed = true;
+      LogSerial.println("  -> Playback confirmed started");
+    }
+  }
+  
+  if (!playConfirmed) {
+    LogSerial.println("  -> Playback did not start, attempting one retry");
+    
+    // Wait a bit longer before retrying
+    delay(200);
+    
+    // Try once more
+    audio_.play(effectId);
+    delay(300);
+    
+    PlayState finalState = audio_.getPlayState();
+    LogSerial.printf("  -> Final audio state: %d\n", static_cast<int>(finalState));
+    
+    if (finalState != PlayState::PLAY) {
+      LogSerial.println("  -> ERROR: Audio playback failed completely!");
+    }
+  }
 }
 
-void playLightEffect(const char *effectId) {
+void playLightEffect(uint16_t effectId) {
   // TODO: Integrate with your lighting controller (e.g., NeoPixels, relays).
-  Serial.printf("  -> Activating light effect: %s\n", effectId);
+  LogSerial.printf("  -> Activating light effect: %u\n", effectId);
+  switch (effectId)
+  {
+  case 1:
+    /* code */
+    ledStrip_.lightning(0xFF4400);
+    break;
+  case 2:
+    /* code */
+    ledStrip_.fire(150);
+    break;
+  case 3:
+    /* code */
+    ledStrip_.rainbow(3000);
+    break;
+  case 4:
+    /* code */
+    ledStrip_.sparkle(0x00FF00, 20);
+    break;
+  case 5:
+    /* code */
+    ledStrip_.strobe(0xFFFFFF, 100);
+    break;
+  case 6:
+    /* code */
+    ledStrip_.pulseColor(0x0000FF, 2000);
+    break;
+  case 7:
+    /* code */
+    ledStrip_.gradientPulse(0xFF00FF, 0x00FFFF, 3000);
+    break;  
+  default:
+    break;
+  }
+  
 }
 
