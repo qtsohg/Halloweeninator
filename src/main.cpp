@@ -34,7 +34,7 @@ static const EffectConfig kEffects[] = {
     {"0005", 5, 5},
     {"0006", 6, 6},
     {"0007", 7, 7},
-    {"0008", 1, 1},
+    {"0001", 1, 1},
 };
 
 static constexpr size_t kEffectCount = 8;
@@ -62,6 +62,7 @@ void triggerEffect(const EffectConfig &effect);
 void scheduleNextTrigger();
 void playSoundEffect(uint16_t effectId);
 void playLightEffect(uint16_t effectId);
+bool tryPlaySoundEffect(uint16_t effectId);  // New function that returns success/failure
 
 // Allow runtime tuning of the detection distance.
 void setDetectionDistanceCm(float distanceCm) { g_detectionDistanceCm = distanceCm; }
@@ -108,17 +109,23 @@ void loop() {
 
   // Print audio play state less frequently
   static unsigned long lastAudioStateLog = 0;
+  static PlayState lastLoggedPlayState = PlayState::UNKNOWN;
   if (now - lastAudioStateLog > 2000) {  // Every 2 seconds instead of every poll
     lastAudioStateLog = now;
     PlayState playState = audio_.getPlayState();
-    
-   if (playState == PlayState::STOP) {
-      LogSerial.printf("Audio is active (state: STOP)\n");
+
+    if (playState != lastLoggedPlayState) {
+      LogSerial.printf("Audio state changed: %d\n", static_cast<int>(playState));
+      lastLoggedPlayState = playState;
+    }
+
+    if (lastLoggedPlayState == PlayState::STOP) {
+      //LogSerial.printf("Audio is active (state: STOP)\n");
       ledStrip_.off();
     }
   }
 
-  if (now - g_lastSensorSampleAt < kSensorPollIntervalMs) {
+  if (now - g_lastSensorSampleAt < kSensorPollIntervalMs || lastLoggedPlayState != PlayState::STOP) {
     delay(5);
     return;
   }
@@ -127,8 +134,6 @@ void loop() {
 
   const float distanceCm = readDistanceCm();
  
-  
-
   if (distanceCm < 0.0f) {
     // No valid reading, try again on the next loop iteration.
     return;
@@ -137,22 +142,30 @@ void loop() {
 
   if (distanceCm <= g_detectionDistanceCm && now >= g_nextTriggerReadyAt) {
     // Check if audio is ready before triggering
-    PlayState currentPlayState = audio_.getPlayState();
-    if (currentPlayState != PlayState::STOP) {
-      LogSerial.printf("Audio busy (state: %d), skipping trigger\n", static_cast<int>(currentPlayState));
+    if (lastLoggedPlayState != PlayState::STOP) {
+      LogSerial.printf("Audio busy (state: %d), skipping trigger\n", static_cast<int>(lastLoggedPlayState));
       return;
     }
     
     // Sequential effect selection for debugging
     const size_t effectIndex = g_currentEffectIndex;
-    g_currentEffectIndex = (g_currentEffectIndex + 1) % kEffectCount;
+    //g_currentEffectIndex = (g_currentEffectIndex + 1) % kEffectCount;
     
     const EffectConfig &effect = kEffects[effectIndex];
 
     LogSerial.printf("Target detected at %.2f cm. Triggering effect: %s (index %zu)\n", distanceCm,
                   effect.name, effectIndex);
-    triggerEffect(effect);
-    scheduleNextTrigger();
+    
+    bool effectSucceeded = true; // tryPlaySoundEffect(effect.soundEffectIdx);
+    audio_.playByFilename(effect.name);
+    if (effectSucceeded) {
+      playLightEffect(effect.lightEffect);
+      scheduleNextTrigger();
+      g_currentEffectIndex = (g_currentEffectIndex + 1) % kEffectCount;
+    } else {
+      LogSerial.println("Effect failed, not scheduling cooldown - can retry immediately");
+      // Don't schedule next trigger, so it can be tried again right away
+    }
   }
     
 }
@@ -182,8 +195,12 @@ float readDistanceCm() {
 }
 
 void triggerEffect(const EffectConfig &effect) {
-  playSoundEffect(effect.soundEffectIdx);
-  playLightEffect(effect.lightEffect);
+  bool audioStarted = tryPlaySoundEffect(effect.soundEffectIdx);
+  if (audioStarted) {
+    playLightEffect(effect.lightEffect);
+  } else {
+    LogSerial.println("Audio failed to start, skipping light effect");
+  }
 }
 
 void scheduleNextTrigger() {
@@ -197,28 +214,30 @@ void scheduleNextTrigger() {
 // Hardware integration stubs
 // -----------------------------------------------------------------------------
 
+bool tryPlaySoundEffect(uint16_t effectId) {
+  LogSerial.printf("  -> Attempting to play sound effect ID: %u\n", effectId);
+  
+  // Simple approach: just send the play command
+  audio_.play(effectId);
+  
+  // Wait half a second then check if it's playing
+  delay(500);
+  
+  PlayState currentState = audio_.getPlayState();
+  LogSerial.printf("  -> Audio state after 500ms: %d\n", static_cast<int>(currentState));
+  
+  if (currentState == PlayState::PLAY) {
+    LogSerial.println("  -> Audio playback confirmed");
+    return true;
+  } else {
+    LogSerial.println("  -> Audio playback failed");
+    return false;
+  }
+}
+
 void playSoundEffect(uint16_t effectId) {
   LogSerial.printf("  -> Attempting to play sound effect ID: %u\n", effectId);
   
-  // First, always stop any current playback and wait for it to actually stop
-  LogSerial.println("  -> Stopping current audio");
-  audio_.endPlay();
-  
-  // Wait for the stop command to be processed and confirmed
-  uint32_t stopStartTime = millis();
-  bool stopConfirmed = false;
-  while (millis() - stopStartTime < 1000 && !stopConfirmed) { // 1 second timeout
-    delay(100);
-    PlayState currentState = audio_.getPlayState();
-    if (currentState == PlayState::STOP) {
-      stopConfirmed = true;
-      LogSerial.println("  -> Stop confirmed");
-    }
-  }
-  
-  if (!stopConfirmed) {
-    LogSerial.println("  -> WARNING: Stop not confirmed, proceeding anyway");
-  }
   
   // Additional delay to ensure module is ready
   delay(100);
@@ -230,16 +249,16 @@ void playSoundEffect(uint16_t effectId) {
   // Wait for the play command to be processed and confirmed
   uint32_t playStartTime = millis();
   bool playConfirmed = false;
-  while (millis() - playStartTime < 1000 && !playConfirmed) { // 1 second timeout
-    delay(150); // Longer delay between checks
-    PlayState currentState = audio_.getPlayState();
-    LogSerial.printf("  -> Checking play state: %d\n", static_cast<int>(currentState));
-    if (currentState == PlayState::PLAY) {
-      playConfirmed = true;
-      LogSerial.println("  -> Playback confirmed started");
-    }
-  }
+
+  delay(500);
   
+  PlayState currentState = audio_.getPlayState();
+  LogSerial.printf("  -> Checking play state: %d\n", static_cast<int>(currentState));
+  if (currentState == PlayState::PLAY) {
+    playConfirmed = true;
+    LogSerial.println("  -> Playback confirmed started");
+  }
+
   if (!playConfirmed) {
     LogSerial.println("  -> Playback did not start, attempting one retry");
     

@@ -9,7 +9,7 @@ constexpr const char *DEVICE_ID = "halloweeninator";
 
 // Led constants
 constexpr uint8_t LED_COUNT = 119;
-constexpr uint8_t LED_BRIGHTNESS = 250; // out of 255
+constexpr uint8_t LED_BRIGHTNESS = 180; // out of 255
 
 // Pins
 constexpr uint8_t LED_PIN = 5;
