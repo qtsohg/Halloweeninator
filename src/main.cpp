@@ -1,16 +1,21 @@
 #include <Arduino.h>
+#include <espmods/core.hpp>
+#include <espmods/network.hpp>
+#include <espmods/led.hpp>
+#include <espmods/audio.hpp>
+#include "NetworkConfigHelper.h"
 
-// -----------------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------------
+using espmods::core::LogSerial;
+using espmods::network::NetWifiOta;
+using espmods::network::NetworkConfig;
+using espmods::led::LedStrip;
+using espmods::audio::AudioDySv5w;
 
-#ifndef ULTRA_TRIG_PIN
-#define ULTRA_TRIG_PIN 23
-#endif
 
-#ifndef ULTRA_ECHO_PIN
-#define ULTRA_ECHO_PIN 22
-#endif
+NetWifiOta wifiOta_;
+LedStrip ledStrip_(LED_PIN, 50, 128);
+AudioDySv5w audio(AUDIO_TX_PIN, AUDIO_RX_PIN);
+
 
 struct EffectConfig {
   const char *name;         // Friendly label for logging
@@ -54,8 +59,19 @@ void playLightEffect(const char *effectId);
 void setDetectionDistanceCm(float distanceCm) { g_detectionDistanceCm = distanceCm; }
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Halloweeninator Starting...");
+  LogSerial.begin(115200);
+  LogSerial.println("Halloweeninator Starting...");
+
+  ledStrip_.begin();
+  ledStrip_.sparkle(0xEEF22F);
+
+  audio.begin();
+
+  // configure network
+  NetworkConfig config = createNetworkConfig();
+  
+
+  wifiOta_.begin(config);
 
   pinMode(ULTRA_TRIG_PIN, OUTPUT);
   pinMode(ULTRA_ECHO_PIN, INPUT);
@@ -67,6 +83,9 @@ void setup() {
 
 void loop() {
   const unsigned long now = millis();
+
+  wifiOta_.loop();
+  ledStrip_.update();
 
   if (now - g_lastSensorSampleAt < kSensorPollIntervalMs) {
     delay(5);
