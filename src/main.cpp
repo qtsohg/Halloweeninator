@@ -7,6 +7,7 @@
 #include "NetworkConfigHelper.h"
 
 using espmods::core::LogSerial;
+using espmods::core::Storage;
 using espmods::network::NetWifiOta;
 using espmods::network::NetworkConfig;
 using espmods::led::LedStrip;
@@ -18,7 +19,7 @@ NetWifiOta wifiOta_;
 LedStrip ledStrip_(LED_PIN, LED_COUNT, LED_BRIGHTNESS);
 //AudioDySv5w audio_(AUDIO_TX_PIN, AUDIO_RX_PIN);
 DY::Player audio_(&Serial2);
-
+Storage storage_;
 WidgetDashboard dashboard_;
 
 struct EffectConfig {
@@ -38,23 +39,25 @@ static const EffectConfig kEffects[] = {
     {"/0007.mp3", 7, 8},
 };
 
-static constexpr size_t kEffectCount = 8;
+static constexpr size_t kEffectCount = 7;
 
 // Debug and configuration parameters
 static constexpr bool kDebugSequentialEffects = false;  // Set to true for sequential debugging, false for random
 
 // Adjustable runtime parameters.
 static float g_detectionDistanceCm = 60.0f;             // Trigger distance
-static constexpr uint32_t kCooldownMinMs = 1000;        // Minimum cooldown after an effect
-static constexpr uint32_t kCooldownMaxMs = 5000;       // Maximum cooldown after an effect
+
 static constexpr uint32_t kSensorPollIntervalMs = 500;  // Sensor sampling interval
 
 // -----------------------------------------------------------------------------
 // Internal state
 // -----------------------------------------------------------------------------
 
-static unsigned long g_nextTriggerReadyAt = 0;
+static uint32_t g_cooldownMinMs = 1000;        // Minimum cooldown after an effect (configurable)
+static uint32_t g_cooldownMaxMs = 5000;        // Maximum cooldown after an effect (configurable)
 static unsigned long g_lastSensorSampleAt = 0;
+static unsigned long g_nextTriggerReadyAt = 0;
+
 static size_t g_currentEffectIndex = 0;  // For sequential effect playback
 
 // -----------------------------------------------------------------------------
@@ -71,9 +74,35 @@ bool tryPlaySoundEffect(const EffectConfig &effect);  // New function that retur
 // Allow runtime tuning of the detection distance.
 void setDetectionDistanceCm(float distanceCm) { g_detectionDistanceCm = distanceCm; }
 
+// Configuration persistence functions
+void loadConfiguration() {
+  g_detectionDistanceCm = storage_.loadFloat("detection_distance", 60.0f);
+  g_cooldownMinMs = storage_.loadUInt32("cooldown_min", 1000);
+  g_cooldownMaxMs = storage_.loadUInt32("cooldown_max", 5000);
+  
+  LogSerial.printfln("Loaded config - Detection: %.1f cm, Cooldown: %lu-%lu ms", 
+                    g_detectionDistanceCm, 
+                    static_cast<unsigned long>(g_cooldownMinMs),
+                    static_cast<unsigned long>(g_cooldownMaxMs));
+}
+
+void saveConfiguration() {
+  storage_.saveFloat("detection_distance", g_detectionDistanceCm);
+  storage_.saveUInt32("cooldown_min", g_cooldownMinMs);
+  storage_.saveUInt32("cooldown_max", g_cooldownMaxMs);
+  LogSerial.printfln("Configuration saved to flash");
+}
+
 void setup() {
   LogSerial.begin(115200);
   LogSerial.println("Halloweeninator Starting...");
+  
+  // Enable capture of system logs to web console
+  espmods::core::enableSerialCapture();
+
+  // Initialize storage and load saved configuration
+  storage_.begin();
+  loadConfiguration();
 
   ledStrip_.begin();
   ledStrip_.sparkle(0xEEF22F);
@@ -85,19 +114,62 @@ void setup() {
   // configure network
   NetworkConfig config = createNetworkConfig();
 
-  // Let's add a custom dashboard to set the sensor distance
-  WidgetDashboard::SliderConfig brightnessSlider;
-  brightnessSlider.id = "dection_distance";
-  brightnessSlider.label = "Detection Distance (cm)";
-  brightnessSlider.min = 10.0f;
-  brightnessSlider.max = 200.0f;
-  brightnessSlider.step = 1.0f;
-  brightnessSlider.value = g_detectionDistanceCm;
-  brightnessSlider.onChange = [](float value) {
+  // Detection Distance Slider
+  WidgetDashboard::SliderConfig distanceSlider;
+  distanceSlider.id = "detection_distance";
+  distanceSlider.label = "Detection Distance (cm)";
+  distanceSlider.min = 10.0f;
+  distanceSlider.max = 200.0f;
+  distanceSlider.step = 1.0f;
+  distanceSlider.value = g_detectionDistanceCm;
+  distanceSlider.onChange = [](float value) {
     g_detectionDistanceCm = value;
-    LogSerial.printf("Detection Distance (cm) → %.1f cm\n", value);
+    LogSerial.printfln("Detection Distance → %.1f cm", value);
+    storage_.saveFloat("detection_distance", value);
   };
-  dashboard_.addSlider(brightnessSlider);
+  dashboard_.addSlider(distanceSlider);
+
+  // Minimum Cooldown Slider
+  WidgetDashboard::SliderConfig cooldownMinSlider;
+  cooldownMinSlider.id = "cooldown_min";
+  cooldownMinSlider.label = "Min Cooldown (ms)";
+  cooldownMinSlider.min = 500.0f;
+  cooldownMinSlider.max = 10000.0f;
+  cooldownMinSlider.step = 100.0f;
+  cooldownMinSlider.value = static_cast<float>(g_cooldownMinMs);
+  cooldownMinSlider.onChange = [](float value) {
+    g_cooldownMinMs = static_cast<uint32_t>(value);
+    LogSerial.printfln("Min Cooldown → %lu ms", static_cast<unsigned long>(g_cooldownMinMs));
+    storage_.saveUInt32("cooldown_min", g_cooldownMinMs);
+    // Ensure min doesn't exceed max
+    if (g_cooldownMinMs > g_cooldownMaxMs) {
+      g_cooldownMaxMs = g_cooldownMinMs;
+      storage_.saveUInt32("cooldown_max", g_cooldownMaxMs);
+      LogSerial.printfln("Adjusted Max Cooldown → %lu ms", static_cast<unsigned long>(g_cooldownMaxMs));
+    }
+  };
+  dashboard_.addSlider(cooldownMinSlider);
+
+  // Maximum Cooldown Slider
+  WidgetDashboard::SliderConfig cooldownMaxSlider;
+  cooldownMaxSlider.id = "cooldown_max";
+  cooldownMaxSlider.label = "Max Cooldown (ms)";
+  cooldownMaxSlider.min = 1000.0f;
+  cooldownMaxSlider.max = 30000.0f;
+  cooldownMaxSlider.step = 100.0f;
+  cooldownMaxSlider.value = static_cast<float>(g_cooldownMaxMs);
+  cooldownMaxSlider.onChange = [](float value) {
+    g_cooldownMaxMs = static_cast<uint32_t>(value);
+    LogSerial.printfln("Max Cooldown → %lu ms", static_cast<unsigned long>(g_cooldownMaxMs));
+    storage_.saveUInt32("cooldown_max", g_cooldownMaxMs);
+    // Ensure max doesn't go below min
+    if (g_cooldownMaxMs < g_cooldownMinMs) {
+      g_cooldownMinMs = g_cooldownMaxMs;
+      storage_.saveUInt32("cooldown_min", g_cooldownMinMs);
+      LogSerial.printfln("Adjusted Min Cooldown → %lu ms", static_cast<unsigned long>(g_cooldownMinMs));
+    }
+  };
+  dashboard_.addSlider(cooldownMaxSlider);
 
   config.dashboard = &dashboard_;
   wifiOta_.begin(config);
@@ -132,7 +204,7 @@ void loop() {
   static unsigned long lastAudioStateLog = 0;
   static DY::PlayState lastLoggedPlayState = DY::PlayState::Stopped;
 
-  if (now - lastAudioStateLog > 2000) {  // Every 2 seconds instead of every poll
+  if ((lastLoggedPlayState ==  DY::PlayState::Playing && now - lastAudioStateLog > 1000) || (now - lastAudioStateLog > 2000)) {  // Every 2 seconds instead of every poll
     lastAudioStateLog = now;
     DY::PlayState playState = audio_.checkPlayState();
 
@@ -154,18 +226,20 @@ void loop() {
 
   g_lastSensorSampleAt = now;
 
-  const float distanceCm = readDistanceCm();
- 
-  if (distanceCm < 0.0f) {
-    // No valid reading, try again on the next loop iteration.
-    return;
-  }
-  LogSerial.printf("Distance: %.2f cm\n", distanceCm);
+  
+  if (now >= g_nextTriggerReadyAt) {
 
-  if (distanceCm <= g_detectionDistanceCm && now >= g_nextTriggerReadyAt) {
+    const float distanceCm = readDistanceCm();
+    LogSerial.printfln("Distance: %.2f cm", distanceCm);
+ 
+    if (distanceCm < 0.0f || distanceCm > g_detectionDistanceCm) {
+      // No valid reading, try again on the next loop iteration.
+      return;
+    }
+
     // Check if audio is ready before triggering
     if (lastLoggedPlayState != DY::PlayState::Stopped) {
-      LogSerial.printf("Audio busy (state: %d), skipping trigger\n", static_cast<int>(lastLoggedPlayState));
+      LogSerial.printfln("Audio busy (state: %d), skipping trigger", static_cast<int>(lastLoggedPlayState));
       return;
     }
     
@@ -237,7 +311,7 @@ void triggerEffect(const EffectConfig &effect) {
 
 void scheduleNextTrigger() {
   const uint32_t cooldownDelay = static_cast<uint32_t>(
-      random(static_cast<long>(kCooldownMinMs), static_cast<long>(kCooldownMaxMs) + 1));
+      random(static_cast<long>(g_cooldownMinMs), static_cast<long>(g_cooldownMaxMs) + 1));
   g_nextTriggerReadyAt = millis() + cooldownDelay;
   LogSerial.printf("Next trigger available in %lu ms\n", static_cast<unsigned long>(cooldownDelay));
 }
