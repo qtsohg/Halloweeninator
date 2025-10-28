@@ -10,6 +10,7 @@ using espmods::core::LogSerial;
 using espmods::network::NetWifiOta;
 using espmods::network::NetworkConfig;
 using espmods::led::LedStrip;
+using espmods::network::WidgetDashboard;  
 
 
 
@@ -17,6 +18,8 @@ NetWifiOta wifiOta_;
 LedStrip ledStrip_(LED_PIN, LED_COUNT, LED_BRIGHTNESS);
 //AudioDySv5w audio_(AUDIO_TX_PIN, AUDIO_RX_PIN);
 DY::Player audio_(&Serial2);
+
+WidgetDashboard dashboard_;
 
 struct EffectConfig {
   const char *name;         // Friendly label for logging
@@ -81,7 +84,22 @@ void setup() {
 
   // configure network
   NetworkConfig config = createNetworkConfig();
-  
+
+  // Let's add a custom dashboard to set the sensor distance
+  WidgetDashboard::SliderConfig brightnessSlider;
+  brightnessSlider.id = "dection_distance";
+  brightnessSlider.label = "Detection Distance (cm)";
+  brightnessSlider.min = 10.0f;
+  brightnessSlider.max = 200.0f;
+  brightnessSlider.step = 1.0f;
+  brightnessSlider.value = g_detectionDistanceCm;
+  brightnessSlider.onChange = [](float value) {
+    g_detectionDistanceCm = value;
+    LogSerial.printf("Detection Distance (cm) → %.1f cm\n", value);
+  };
+  dashboard_.addSlider(brightnessSlider);
+
+  config.dashboard = &dashboard_;
   wifiOta_.begin(config);
 
   pinMode(ULTRA_TRIG_PIN, OUTPUT);
